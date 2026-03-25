@@ -32,7 +32,7 @@ import {
  * @property {import("./spawner/GameServerSpawner.js").GameServerSpawner} spawner
  * @property {number} [tickRateHz=20]
  * @property {string} gameLogicModulePath
- * @property {Record<string, unknown>} [gameConfig]
+ * @property {Record<string, unknown>} [gameInstanceConfig]
  */
 
 /**
@@ -372,7 +372,7 @@ export class SessionManager {
         matchId,
         players: this.#lobby.buildPlayerManifest(),
         tickRateHz: this.#config.tickRateHz,
-        gameConfig: this.#config.gameConfig,
+        gameInstanceConfig: this.#config.gameInstanceConfig,
       });
 
       this.#currentInstance = instance;

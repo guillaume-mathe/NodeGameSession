@@ -39,7 +39,7 @@ export const CTRL_ABORT = "ctrl:abort";
  * @property {string} matchId
  * @property {PlayerManifestEntry[]} players
  * @property {number} tickRateHz
- * @property {Record<string, unknown>} [gameConfig]
+ * @property {Record<string, unknown>} [gameInstanceConfig]
  */
 
 /**
@@ -58,13 +58,17 @@ export const CTRL_ABORT = "ctrl:abort";
  */
 
 /**
- * @typedef {Object} PlayerMatchResult
- * @property {string} playerId
- * @property {"win" | "loss" | "draw"} outcome
- * @property {number} score
+ * Re-exported from node-game-server contracts for convenience.
+ * @typedef {import("node-game-server/src/core/contracts.js").PlayerMatchResult} PlayerMatchResult
  */
 
 /**
+ * Re-exported from node-game-server contracts for convenience.
+ * @typedef {import("node-game-server/src/core/contracts.js").MatchResult} MatchResult
+ */
+
+/**
+ * Control-channel envelope wrapping a MatchResult with routing metadata.
  * @typedef {Object} MatchResultMessage
  * @property {typeof CTRL_MATCH_RESULT} kind
  * @property {string} matchId

@@ -67,7 +67,7 @@ const session = new SessionManager(config);
 | `gameLogicModulePath` | `string` | — | Path to the game server entry module |
 | `tickRateHz` | `number` | `20` | Game server tick rate |
 | `statsStore` | `StatsStore` | `undefined` | Optional stats persistence backend |
-| `gameConfig` | `Record<string, unknown>` | `undefined` | Optional game-specific configuration passed to the game server |
+| `gameInstanceConfig` | `Record<string, unknown>` | `undefined` | Optional game-specific configuration passed to the game server |
 
 ### Getters
 
@@ -349,7 +349,7 @@ Abstract base class for game server spawners. Subclass this to implement a speci
   matchId: string;
   players: PlayerManifestEntry[];
   tickRateHz: number;
-  gameConfig?: Record<string, unknown>;
+  gameInstanceConfig?: Record<string, unknown>;
 }
 ```
 
@@ -573,7 +573,7 @@ Get stats for a player, creating a new record if none exists. This is a concrete
 #### `SpawnMessage`
 
 ```ts
-{ kind: "ctrl:spawn"; matchId: string; players: PlayerManifestEntry[]; tickRateHz: number; gameConfig?: Record<string, unknown> }
+{ kind: "ctrl:spawn"; matchId: string; players: PlayerManifestEntry[]; tickRateHz: number; gameInstanceConfig?: Record<string, unknown> }
 ```
 
 #### `ReadyMessage`

@@ -74,7 +74,7 @@ export class ChildProcessSpawner extends GameServerSpawner {
       players: config.players,
       tickRateHz: config.tickRateHz,
       port,
-      gameConfig: config.gameConfig,
+      gameInstanceConfig: config.gameInstanceConfig,
     });
 
     return {

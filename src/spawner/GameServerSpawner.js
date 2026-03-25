@@ -12,7 +12,7 @@
  * @property {string} matchId
  * @property {import("../protocol/controlChannel.js").PlayerManifestEntry[]} players
  * @property {number} tickRateHz
- * @property {Record<string, unknown>} [gameConfig]
+ * @property {Record<string, unknown>} [gameInstanceConfig]
  */
 
 /**
