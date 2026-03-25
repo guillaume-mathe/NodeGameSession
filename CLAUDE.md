@@ -65,11 +65,13 @@ npm test               # vitest run (all test/**/*.test.js)
 
 - **Plain JavaScript with JSDoc types** — no TypeScript source files
 - esbuild bundles ESM; tsc emits `.d.ts` declarations only
-- `platform: "node"`, `ws` is external (not bundled)
+- `platform: "node"`, `ws` and `rxjs` are external (not bundled)
 - Matches sibling library pattern (NodeGameECS, NodeGameClient, etc.)
-- Use `node:` prefix for Node.js built-in imports (e.g. `node:events`)
+- Use `node:` prefix for Node.js built-in imports (e.g. `node:crypto`)
 - Classes use private fields (`#field`) for encapsulation
 - Interface/base classes throw `"Not implemented"` from method stubs
+- **RxJS conventions**: `BehaviorSubject` for current-value state, `Subject` for events; `$` suffix on observable fields; expose `.asObservable()` via getters; every class with subjects has a `dispose()` method that completes them
+- No `EventEmitter` — all event streams use RxJS subjects/observables
 
 ## Source structure
 

@@ -8,7 +8,7 @@ await esbuild.build({
   target: ["es2022"],
   platform: "node",
   format: "esm",
-  external: ["ws"],
+  external: ["ws", "rxjs"],
   outfile: "dist/node-game-session.js",
   logLevel: "info",
 });

@@ -1,4 +1,4 @@
-import { EventEmitter } from "node:events";
+import { BehaviorSubject, Subject } from "rxjs";
 
 /**
  * @enum {string}
@@ -28,16 +28,30 @@ const TRANSITIONS = {
 /**
  * Lifecycle state machine for a game session.
  *
- * Emits:
- * - `"transition"` with `{ from, to }` on every valid transition
+ * Observables:
+ * - `state$`      — BehaviorSubject of the current lifecycle state
+ * - `transition$` — emits `{ from, to }` on every valid transition
  */
-export class LifecycleStateMachine extends EventEmitter {
-  /** @type {string} */
-  #state = LifecycleState.LOBBY;
+export class LifecycleStateMachine {
+  /** @type {BehaviorSubject<string>} */
+  #state$ = new BehaviorSubject(LifecycleState.LOBBY);
 
-  /** Current lifecycle state. */
+  /** @type {Subject<{ from: string, to: string }>} */
+  #transition$ = new Subject();
+
+  /** Current lifecycle state (synchronous read). */
   get state() {
-    return this.#state;
+    return this.#state$.getValue();
+  }
+
+  /** Observable of the current lifecycle state. Emits current value on subscribe. */
+  get state$() {
+    return this.#state$.asObservable();
+  }
+
+  /** Observable of `{ from, to }` transition events. */
+  get transition$() {
+    return this.#transition$.asObservable();
   }
 
   /**
@@ -46,7 +60,7 @@ export class LifecycleStateMachine extends EventEmitter {
    * @returns {boolean}
    */
   canTransition(target) {
-    const allowed = TRANSITIONS[this.#state];
+    const allowed = TRANSITIONS[this.state];
     return allowed !== undefined && allowed.includes(target);
   }
 
@@ -58,20 +72,26 @@ export class LifecycleStateMachine extends EventEmitter {
   transition(target) {
     if (!this.canTransition(target)) {
       throw new Error(
-        `Invalid transition: ${this.#state} → ${target}`,
+        `Invalid transition: ${this.state} → ${target}`,
       );
     }
-    const from = this.#state;
-    this.#state = target;
-    this.emit("transition", { from, to: target });
+    const from = this.state;
+    this.#state$.next(target);
+    this.#transition$.next({ from, to: target });
   }
 
   /** Reset the state machine back to LOBBY. */
   reset() {
-    const from = this.#state;
-    this.#state = LifecycleState.LOBBY;
+    const from = this.state;
+    this.#state$.next(LifecycleState.LOBBY);
     if (from !== LifecycleState.LOBBY) {
-      this.emit("transition", { from, to: LifecycleState.LOBBY });
+      this.#transition$.next({ from, to: LifecycleState.LOBBY });
     }
+  }
+
+  /** Complete all subjects and release resources. */
+  dispose() {
+    this.#transition$.complete();
+    this.#state$.complete();
   }
 }

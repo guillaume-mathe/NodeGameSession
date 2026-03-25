@@ -51,8 +51,6 @@ import {
 
 Main session orchestrator. Manages the lobby, lifecycle state machine, game server spawning, and player WebSocket connections.
 
-Extends `EventEmitter`.
-
 ### Constructor
 
 ```js
@@ -95,7 +93,7 @@ Start the session manager WebSocket server.
 
 #### `shutdown()`
 
-Gracefully shut down the session manager. Closes the WebSocket server, shuts down any running game server, and cleans up resources.
+Gracefully shut down the session manager. Closes the WebSocket server, shuts down any running game server, disposes lifecycle/lobby, and completes all subjects.
 
 **Returns:** `Promise<void>`
 
@@ -105,21 +103,23 @@ Get a snapshot of the current lobby state.
 
 **Returns:** `{ players: LobbyPlayer[], lifecycleState: string }`
 
-### Events
+### Observables
 
-| Event | Payload | Description |
+| Observable | Payload | Description |
 |---|---|---|
-| `"matchStarted"` | `{ matchId: string }` | A match has been spawned and started |
-| `"matchEnded"` | `{ matchId: string, results: PlayerMatchResult[] }` | A match has ended with results |
-| `"error"` | `Error` | An error occurred |
+| `matchStarted$` | `{ matchId: string }` | A match has been spawned and started |
+| `matchEnded$` | `{ matchId: string, results: PlayerMatchResult[] }` | A match has ended with results |
+| `error$` | `Error` | An error occurred |
+
+### Cleanup
+
+Call `shutdown()` to complete all subjects, close WebSocket connections, and release resources.
 
 ---
 
 ## LifecycleStateMachine
 
-Finite state machine for the session lifecycle. Enforces a strict transition table and emits events on state changes.
-
-Extends `EventEmitter`.
+Finite state machine for the session lifecycle. Enforces a strict transition table and exposes state changes as RxJS observables.
 
 ### LifecycleState
 
@@ -149,7 +149,7 @@ Enum of all lifecycle states:
 
 #### `state`
 
-**Returns:** `string` — the current lifecycle state.
+**Returns:** `string` — the current lifecycle state (synchronous read via `BehaviorSubject.getValue()`).
 
 ### Methods
 
@@ -177,23 +177,28 @@ Transition to `target` if valid. Throws if the transition is not allowed.
 
 #### `reset()`
 
-Reset the state machine back to `LOBBY`. Emits a `"transition"` event if not already in `LOBBY`.
+Reset the state machine back to `LOBBY`. Emits on `transition$` if not already in `LOBBY`.
 
 **Returns:** `void`
 
-### Events
+#### `dispose()`
 
-| Event | Payload | Description |
+Complete all subjects and release resources. Call when the state machine is no longer needed.
+
+**Returns:** `void`
+
+### Observables
+
+| Observable | Type | Description |
 |---|---|---|
-| `"transition"` | `{ from: string, to: string }` | Fired on every valid state transition |
+| `state$` | `Observable<string>` | BehaviorSubject — emits current state on subscribe, then on every change |
+| `transition$` | `Observable<{ from: string, to: string }>` | Emits on every valid state transition |
 
 ---
 
 ## Lobby
 
 Manages the set of connected players and their ready state. The first player to join becomes the lobby leader; if the leader leaves, leadership passes to the next player.
-
-Extends `EventEmitter`.
 
 ### StartCondition
 
@@ -289,6 +294,12 @@ Build a player manifest for the game server spawn message.
 
 **Returns:** `PlayerManifestEntry[]`
 
+#### `dispose()`
+
+Complete all subjects and release resources. Call when the lobby is no longer needed.
+
+**Returns:** `void`
+
 ### Types
 
 #### `LobbyPlayer`
@@ -302,13 +313,14 @@ Build a player manifest for the game server spawn message.
 }
 ```
 
-### Events
+### Observables
 
-| Event | Payload | Description |
+| Observable | Type | Description |
 |---|---|---|
-| `"playerAdded"` | `{ player: LobbyPlayer }` | A player was added to the lobby |
-| `"playerRemoved"` | `{ playerId: string }` | A player was removed from the lobby |
-| `"readyChanged"` | `{ playerId: string, ready: boolean }` | A player's ready state changed |
+| `players$` | `Observable<LobbyPlayer[]>` | BehaviorSubject — emits full player list on subscribe, then on every mutation |
+| `playerAdded$` | `Observable<{ player: LobbyPlayer }>` | Emits when a player is added to the lobby |
+| `playerRemoved$` | `Observable<{ playerId: string }>` | Emits when a player is removed from the lobby |
+| `readyChanged$` | `Observable<{ playerId: string, ready: boolean }>` | Emits when a player's ready state changes |
 
 ---
 
@@ -325,6 +337,7 @@ Abstract base class for game server spawners. Subclass this to implement a speci
   matchId: string;
   port: number;
   host: string;
+  controlMessages$: Observable<unknown>;  // RxJS observable stream of control-channel messages
   handle?: unknown;  // implementation-specific process/container handle
 }
 ```
@@ -342,14 +355,13 @@ Abstract base class for game server spawners. Subclass this to implement a speci
 
 ### Methods
 
-#### `spawn(config, onMessage)`
+#### `spawn(config)`
 
-Spawn a game server instance.
+Spawn a game server instance. Returns an instance with a `controlMessages$` observable for receiving control-channel messages.
 
 | Name | Type | Description |
 |---|---|---|
 | `config` | `SpawnConfig` | Match configuration |
-| `onMessage` | `(message: unknown) => void` | Callback for control-channel messages from the server |
 
 **Returns:** `Promise<GameServerInstance>`
 
@@ -378,7 +390,7 @@ Shut down a running game server instance.
 
 ## ChildProcessSpawner
 
-Spawns game server instances as Node.js child processes on the local machine. Communication uses Node.js IPC (`child_process.fork` with `send` / `on("message")`).
+Spawns game server instances as Node.js child processes on the local machine. Communication uses Node.js IPC (`child_process.fork` with `send` / `on("message")`). IPC messages are surfaced via the `controlMessages$` observable on the returned instance.
 
 Extends `GameServerSpawner`.
 
@@ -396,7 +408,9 @@ const spawner = new ChildProcessSpawner(opts);
 
 ### Methods
 
-Inherits `spawn(config, onMessage)`, `send(instance, message)`, and `shutdown(instance)` from `GameServerSpawner`.
+Inherits `spawn(config)`, `send(instance, message)`, and `shutdown(instance)` from `GameServerSpawner`.
+
+`shutdown()` sends `CTRL_SHUTDOWN` and waits up to 5 seconds for graceful exit before sending SIGTERM.
 
 ---
 

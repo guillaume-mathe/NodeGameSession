@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   LifecycleStateMachine,
   LifecycleState,
@@ -10,6 +10,10 @@ describe("LifecycleStateMachine", () => {
 
   beforeEach(() => {
     sm = new LifecycleStateMachine();
+  });
+
+  afterEach(() => {
+    sm.dispose();
   });
 
   it("starts in LOBBY", () => {
@@ -29,9 +33,9 @@ describe("LifecycleStateMachine", () => {
     );
   });
 
-  it("emits 'transition' event on valid transition", () => {
+  it("emits transition event via transition$ observable", () => {
     const handler = vi.fn();
-    sm.on("transition", handler);
+    sm.transition$.subscribe(handler);
     sm.transition(LifecycleState.STARTING);
     expect(handler).toHaveBeenCalledWith({
       from: LifecycleState.LOBBY,
@@ -41,7 +45,7 @@ describe("LifecycleStateMachine", () => {
 
   it("does not emit on failed transition", () => {
     const handler = vi.fn();
-    sm.on("transition", handler);
+    sm.transition$.subscribe(handler);
     try {
       sm.transition(LifecycleState.PLAYING);
     } catch {
@@ -59,7 +63,7 @@ describe("LifecycleStateMachine", () => {
   it("reset() emits transition event", () => {
     sm.transition(LifecycleState.STARTING);
     const handler = vi.fn();
-    sm.on("transition", handler);
+    sm.transition$.subscribe(handler);
     sm.reset();
     expect(handler).toHaveBeenCalledWith({
       from: LifecycleState.STARTING,
@@ -69,7 +73,7 @@ describe("LifecycleStateMachine", () => {
 
   it("reset() does not emit when already in LOBBY", () => {
     const handler = vi.fn();
-    sm.on("transition", handler);
+    sm.transition$.subscribe(handler);
     sm.reset();
     expect(handler).not.toHaveBeenCalled();
   });
@@ -88,7 +92,7 @@ describe("LifecycleStateMachine", () => {
 
   it("completes a full happy-path lifecycle", () => {
     const transitions = vi.fn();
-    sm.on("transition", transitions);
+    sm.transition$.subscribe(transitions);
 
     sm.transition(LifecycleState.STARTING);
     sm.transition(LifecycleState.SYNC_WAIT);
@@ -99,5 +103,22 @@ describe("LifecycleStateMachine", () => {
 
     expect(sm.state).toBe(LifecycleState.LOBBY);
     expect(transitions).toHaveBeenCalledTimes(6);
+  });
+
+  it("state$ emits current value on subscribe (BehaviorSubject)", () => {
+    sm.transition(LifecycleState.STARTING);
+    const values = [];
+    sm.state$.subscribe((v) => values.push(v));
+    expect(values).toEqual([LifecycleState.STARTING]);
+
+    sm.transition(LifecycleState.SYNC_WAIT);
+    expect(values).toEqual([LifecycleState.STARTING, LifecycleState.SYNC_WAIT]);
+  });
+
+  it("dispose() completes subjects", () => {
+    const completeSpy = vi.fn();
+    sm.transition$.subscribe({ complete: completeSpy });
+    sm.dispose();
+    expect(completeSpy).toHaveBeenCalled();
   });
 });

@@ -10,6 +10,8 @@ Part of the **node-game-\*** engine suite. Sits above [`node-game-server`](https
 npm install node-game-session
 ```
 
+Peer dependency: [`rxjs`](https://rxjs.dev/) `^7.8.2` (used for reactive event streams throughout the library).
+
 ## Quick Start
 
 ```js
@@ -31,11 +33,11 @@ const session = new SessionManager({
   gameLogicModulePath: "./game-logic.js",
 });
 
-session.on("matchStarted", ({ matchId }) => {
+session.matchStarted$.subscribe(({ matchId }) => {
   console.log(`Match ${matchId} started`);
 });
 
-session.on("matchEnded", ({ matchId, results }) => {
+session.matchEnded$.subscribe(({ matchId, results }) => {
   console.log(`Match ${matchId} ended`, results);
 });
 

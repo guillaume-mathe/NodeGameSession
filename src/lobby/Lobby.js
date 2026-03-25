@@ -1,4 +1,4 @@
-import { EventEmitter } from "node:events";
+import { BehaviorSubject, Subject } from "rxjs";
 
 /**
  * @enum {string}
@@ -21,12 +21,13 @@ export const StartCondition = /** @type {const} */ ({
 /**
  * Lobby — manages the set of connected players and their ready state.
  *
- * Emits:
- * - `"playerAdded"`   with `{ player }`
- * - `"playerRemoved"` with `{ playerId }`
- * - `"readyChanged"`  with `{ playerId, ready }`
+ * Observables:
+ * - `players$`       — BehaviorSubject of the current player list
+ * - `playerAdded$`   — emits `{ player }` when a player joins
+ * - `playerRemoved$` — emits `{ playerId }` when a player leaves
+ * - `readyChanged$`  — emits `{ playerId, ready }` when ready state changes
  */
-export class Lobby extends EventEmitter {
+export class Lobby {
   /** @type {Map<string, LobbyPlayer>} */
   #players = new Map();
 
@@ -39,6 +40,18 @@ export class Lobby extends EventEmitter {
   /** @type {string} */
   #startCondition;
 
+  /** @type {BehaviorSubject<LobbyPlayer[]>} */
+  #players$ = new BehaviorSubject(/** @type {LobbyPlayer[]} */ ([]));
+
+  /** @type {Subject<{ player: LobbyPlayer }>} */
+  #playerAdded$ = new Subject();
+
+  /** @type {Subject<{ playerId: string }>} */
+  #playerRemoved$ = new Subject();
+
+  /** @type {Subject<{ playerId: string, ready: boolean }>} */
+  #readyChanged$ = new Subject();
+
   /**
    * @param {Object} opts
    * @param {number} opts.minPlayers
@@ -46,10 +59,37 @@ export class Lobby extends EventEmitter {
    * @param {string} [opts.startCondition]
    */
   constructor({ minPlayers, maxPlayers, startCondition = StartCondition.ALL_READY }) {
-    super();
     this.#minPlayers = minPlayers;
     this.#maxPlayers = maxPlayers;
     this.#startCondition = startCondition;
+  }
+
+  /** Observable of the current player list. Emits current value on subscribe. */
+  get players$() {
+    return this.#players$.asObservable();
+  }
+
+  /** Observable of player-added events. */
+  get playerAdded$() {
+    return this.#playerAdded$.asObservable();
+  }
+
+  /** Observable of player-removed events. */
+  get playerRemoved$() {
+    return this.#playerRemoved$.asObservable();
+  }
+
+  /** Observable of ready-state change events. */
+  get readyChanged$() {
+    return this.#readyChanged$.asObservable();
+  }
+
+  /**
+   * Push a fresh snapshot of the player list to `players$`.
+   * @private
+   */
+  #emitPlayers() {
+    this.#players$.next(Array.from(this.#players.values()));
   }
 
   /**
@@ -69,7 +109,8 @@ export class Lobby extends EventEmitter {
     /** @type {LobbyPlayer} */
     const player = { playerId, displayName, ready: false, isLeader };
     this.#players.set(playerId, player);
-    this.emit("playerAdded", { player });
+    this.#emitPlayers();
+    this.#playerAdded$.next({ player });
     return player;
   }
 
@@ -84,7 +125,8 @@ export class Lobby extends EventEmitter {
     if (player.isLeader && this.#players.size > 0) {
       this._electLeader();
     }
-    this.emit("playerRemoved", { playerId });
+    this.#emitPlayers();
+    this.#playerRemoved$.next({ playerId });
   }
 
   /**
@@ -96,7 +138,8 @@ export class Lobby extends EventEmitter {
     if (!player) throw new Error(`Unknown player ${playerId}`);
     if (!player.ready) {
       player.ready = true;
-      this.emit("readyChanged", { playerId, ready: true });
+      this.#emitPlayers();
+      this.#readyChanged$.next({ playerId, ready: true });
     }
   }
 
@@ -109,7 +152,8 @@ export class Lobby extends EventEmitter {
     if (!player) throw new Error(`Unknown player ${playerId}`);
     if (player.ready) {
       player.ready = false;
-      this.emit("readyChanged", { playerId, ready: false });
+      this.#emitPlayers();
+      this.#readyChanged$.next({ playerId, ready: false });
     }
   }
 
@@ -140,6 +184,7 @@ export class Lobby extends EventEmitter {
     for (const p of this.#players.values()) {
       p.ready = false;
     }
+    this.#emitPlayers();
   }
 
   /**
@@ -162,5 +207,13 @@ export class Lobby extends EventEmitter {
     if (first) {
       first.isLeader = true;
     }
+  }
+
+  /** Complete all subjects and release resources. */
+  dispose() {
+    this.#playerAdded$.complete();
+    this.#playerRemoved$.complete();
+    this.#readyChanged$.complete();
+    this.#players$.complete();
   }
 }

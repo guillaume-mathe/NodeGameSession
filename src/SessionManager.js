@@ -1,4 +1,5 @@
-import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
+import { Subject, fromEvent, takeUntil, take } from "rxjs";
 import { WebSocketServer } from "ws";
 import { LifecycleStateMachine, LifecycleState } from "./lifecycle/LifecycleStateMachine.js";
 import { Lobby } from "./lobby/Lobby.js";
@@ -40,12 +41,12 @@ import {
  * Manages the lobby, lifecycle state machine, game server spawning,
  * and player WebSocket connections.
  *
- * Emits:
- * - `"matchStarted"`  with `{ matchId }`
- * - `"matchEnded"`    with `{ matchId, results }`
- * - `"error"`         with `Error`
+ * Observables:
+ * - `matchStarted$` — emits `{ matchId }` when a match starts
+ * - `matchEnded$`   — emits `{ matchId, results }` when a match ends
+ * - `error$`        — emits `Error` on errors
  */
-export class SessionManager extends EventEmitter {
+export class SessionManager {
   /** @type {SessionManagerConfig} */
   #config;
 
@@ -64,11 +65,36 @@ export class SessionManager extends EventEmitter {
   /** @type {string | null} */
   #currentMatchId = null;
 
+  /** @type {import("./spawner/GameServerSpawner.js").GameServerInstance | null} */
+  #currentInstance = null;
+
+  /** @type {import("rxjs").Subscription | null} */
+  #controlSub = null;
+
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  #countdownTimer = null;
+
+  /** @type {Set<string>} */
+  #connectedToGameServer = new Set();
+
+  // ── Public observables ────────────────────────────────────────────
+
+  /** @type {Subject<{ matchId: string }>} */
+  #matchStarted$ = new Subject();
+
+  /** @type {Subject<{ matchId: string, results: unknown[] }>} */
+  #matchEnded$ = new Subject();
+
+  /** @type {Subject<Error>} */
+  #error$ = new Subject();
+
+  /** @type {Subject<void>} */
+  #destroy$ = new Subject();
+
   /**
    * @param {SessionManagerConfig} config
    */
   constructor(config) {
-    super();
     this.#config = {
       countdownMs: 3000,
       reconnectGraceMs: 10000,
@@ -92,14 +118,73 @@ export class SessionManager extends EventEmitter {
     return this.#lobby;
   }
 
+  /** Observable that emits when a match starts. */
+  get matchStarted$() {
+    return this.#matchStarted$.asObservable();
+  }
+
+  /** Observable that emits when a match ends. */
+  get matchEnded$() {
+    return this.#matchEnded$.asObservable();
+  }
+
+  /** Observable that emits on errors. */
+  get error$() {
+    return this.#error$.asObservable();
+  }
+
   /**
    * Start the session manager WebSocket server.
    * @param {number} port
    * @returns {Promise<void>}
    */
   async start(port) {
-    // TODO: create WebSocketServer, wire up connection handler
-    throw new Error("Not implemented");
+    this.#wss = new WebSocketServer({ port });
+
+    // Wire up incoming connections
+    fromEvent(this.#wss, "connection")
+      .pipe(takeUntil(this.#destroy$))
+      .subscribe((/** @type {import("ws").WebSocket} */ ws) => {
+        this._handleConnection(ws);
+      });
+
+    // Broadcast lifecycle changes to all clients
+    this.#lifecycle.transition$
+      .pipe(takeUntil(this.#destroy$))
+      .subscribe(({ to }) => {
+        this._broadcast({ kind: SESSION_LIFECYCLE_CHANGE, state: to });
+      });
+
+    // Broadcast player joins
+    this.#lobby.playerAdded$
+      .pipe(takeUntil(this.#destroy$))
+      .subscribe(({ player }) => {
+        this._broadcast({ kind: SESSION_PLAYER_JOINED, player });
+      });
+
+    // Broadcast player leaves
+    this.#lobby.playerRemoved$
+      .pipe(takeUntil(this.#destroy$))
+      .subscribe(({ playerId }) => {
+        this._broadcast({ kind: SESSION_PLAYER_LEFT, playerId });
+      });
+
+    // Auto-start check on ready changes
+    this.#lobby.readyChanged$
+      .pipe(takeUntil(this.#destroy$))
+      .subscribe(() => {
+        if (
+          this.#lifecycle.state === LifecycleState.LOBBY &&
+          this.#lobby.isStartConditionMet()
+        ) {
+          this._startMatch();
+        }
+      });
+
+    // Wait for the server to be listening
+    return new Promise((resolve) => {
+      this.#wss.on("listening", () => resolve());
+    });
   }
 
   /**
@@ -107,8 +192,51 @@ export class SessionManager extends EventEmitter {
    * @returns {Promise<void>}
    */
   async shutdown() {
-    // TODO: close WS server, shut down any running game server, clean up
-    throw new Error("Not implemented");
+    // Signal all takeUntil pipes to unsubscribe
+    this.#destroy$.next();
+    this.#destroy$.complete();
+
+    // Clear countdown timer
+    if (this.#countdownTimer) {
+      clearTimeout(this.#countdownTimer);
+      this.#countdownTimer = null;
+    }
+
+    // Shut down game server if running
+    if (this.#currentInstance) {
+      this.#controlSub?.unsubscribe();
+      this.#controlSub = null;
+      try {
+        await this.#config.spawner.shutdown(this.#currentInstance);
+      } catch {
+        // Ignore shutdown errors
+      }
+      this.#currentInstance = null;
+      this.#currentMatchId = null;
+    }
+
+    // Close all player connections
+    for (const ws of this.#connections.values()) {
+      ws.close();
+    }
+    this.#connections.clear();
+
+    // Close the WSS
+    if (this.#wss) {
+      await new Promise((resolve) => {
+        this.#wss.close(() => resolve());
+      });
+      this.#wss = null;
+    }
+
+    // Dispose lifecycle & lobby subjects
+    this.#lifecycle.dispose();
+    this.#lobby.dispose();
+
+    // Complete our own subjects
+    this.#matchStarted$.complete();
+    this.#matchEnded$.complete();
+    this.#error$.complete();
   }
 
   /**
@@ -124,23 +252,109 @@ export class SessionManager extends EventEmitter {
 
   /**
    * Handle a new WebSocket connection.
-   * @param {import("ws").WebSocket} _ws
+   * @param {import("ws").WebSocket} ws
    * @private
    */
-  _handleConnection(_ws) {
-    // TODO: wire up message/close handlers
-    throw new Error("Not implemented");
+  _handleConnection(ws) {
+    const close$ = new Subject();
+
+    fromEvent(ws, "close")
+      .pipe(take(1))
+      .subscribe(() => {
+        close$.next();
+        close$.complete();
+        const playerId = this._playerIdForWs(ws);
+        if (playerId && this.#lifecycle.state === LifecycleState.LOBBY) {
+          this.#lobby.removePlayer(playerId);
+          this.#connections.delete(playerId);
+        }
+      });
+
+    fromEvent(ws, "message")
+      .pipe(takeUntil(close$), takeUntil(this.#destroy$))
+      .subscribe((/** @type {import("ws").RawData} */ raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          this._handleMessage(ws, msg);
+        } catch (err) {
+          this._sendTo(ws, { kind: SESSION_ERROR, message: "Invalid message format" });
+        }
+      });
   }
 
   /**
    * Handle an incoming client message.
-   * @param {import("ws").WebSocket} _ws
-   * @param {unknown} _data
+   * @param {import("ws").WebSocket} ws
+   * @param {unknown} msg
    * @private
    */
-  _handleMessage(_ws, _data) {
-    // TODO: parse message, dispatch by kind
-    throw new Error("Not implemented");
+  _handleMessage(ws, msg) {
+    const data = /** @type {Record<string, unknown>} */ (msg);
+
+    switch (data.kind) {
+      case CLIENT_JOIN: {
+        try {
+          const player = this.#lobby.addPlayer(
+            /** @type {string} */ (data.playerId),
+            /** @type {string} */ (data.displayName),
+          );
+          this.#connections.set(player.playerId, ws);
+          this._sendTo(ws, {
+            kind: SESSION_LOBBY_STATE,
+            players: this.#lobby.getPlayers(),
+            lifecycleState: this.#lifecycle.state,
+          });
+        } catch (err) {
+          this._sendTo(ws, {
+            kind: SESSION_ERROR,
+            message: /** @type {Error} */ (err).message,
+          });
+        }
+        break;
+      }
+      case CLIENT_READY: {
+        const playerId = this._playerIdForWs(ws);
+        if (playerId) {
+          try {
+            this.#lobby.setReady(playerId);
+          } catch (err) {
+            this._sendTo(ws, {
+              kind: SESSION_ERROR,
+              message: /** @type {Error} */ (err).message,
+            });
+          }
+        }
+        break;
+      }
+      case CLIENT_UNREADY: {
+        const playerId = this._playerIdForWs(ws);
+        if (playerId) {
+          try {
+            this.#lobby.setUnready(playerId);
+          } catch (err) {
+            this._sendTo(ws, {
+              kind: SESSION_ERROR,
+              message: /** @type {Error} */ (err).message,
+            });
+          }
+        }
+        break;
+      }
+      case CLIENT_LEAVE: {
+        const playerId = this._playerIdForWs(ws);
+        if (playerId) {
+          this.#lobby.removePlayer(playerId);
+          this.#connections.delete(playerId);
+        }
+        ws.close();
+        break;
+      }
+      default:
+        this._sendTo(ws, {
+          kind: SESSION_ERROR,
+          message: `Unknown message kind: ${data.kind}`,
+        });
+    }
   }
 
   /**
@@ -148,37 +362,210 @@ export class SessionManager extends EventEmitter {
    * @private
    */
   async _startMatch() {
-    // TODO: transition to STARTING, spawn game server, wire control channel
-    throw new Error("Not implemented");
+    try {
+      this.#lifecycle.transition(LifecycleState.STARTING);
+      const matchId = randomUUID();
+      this.#currentMatchId = matchId;
+      this.#connectedToGameServer.clear();
+
+      const instance = await this.#config.spawner.spawn({
+        matchId,
+        players: this.#lobby.buildPlayerManifest(),
+        tickRateHz: this.#config.tickRateHz,
+        gameConfig: this.#config.gameConfig,
+      });
+
+      this.#currentInstance = instance;
+
+      // Subscribe to control channel messages from the game server
+      this.#controlSub = instance.controlMessages$.subscribe({
+        next: (msg) => this._handleControlMessage(msg),
+        error: (err) => {
+          this.#error$.next(err);
+          // Game server died unexpectedly — abort back to lobby
+          if (this.#lifecycle.state !== LifecycleState.LOBBY) {
+            this._abortToLobby("Game server connection lost");
+          }
+        },
+        complete: () => {
+          // Game server process exited
+          if (
+            this.#lifecycle.state !== LifecycleState.LOBBY &&
+            this.#lifecycle.state !== LifecycleState.RESULTS
+          ) {
+            this._abortToLobby("Game server exited unexpectedly");
+          }
+        },
+      });
+
+      this.#matchStarted$.next({ matchId });
+    } catch (err) {
+      this.#error$.next(/** @type {Error} */ (err));
+      // Roll back to lobby on spawn failure
+      if (this.#lifecycle.state !== LifecycleState.LOBBY) {
+        this.#lifecycle.transition(LifecycleState.LOBBY);
+      }
+    }
   }
 
   /**
    * Handle a control-channel message from the game server.
-   * @param {unknown} _message
+   * @param {unknown} message
    * @private
    */
-  _handleControlMessage(_message) {
-    // TODO: dispatch CTRL_READY, CTRL_PLAYER_CONNECTED, CTRL_MATCH_RESULT
-    throw new Error("Not implemented");
+  _handleControlMessage(message) {
+    const msg = /** @type {Record<string, unknown>} */ (message);
+
+    switch (msg.kind) {
+      case CTRL_READY: {
+        this.#lifecycle.transition(LifecycleState.SYNC_WAIT);
+        // Tell all clients to connect to the game server
+        this._broadcast({
+          kind: SESSION_CONNECT_TO_GAME,
+          matchId: this.#currentMatchId,
+          host: /** @type {string} */ (msg.host),
+          port: /** @type {number} */ (msg.port),
+          token: this.#currentMatchId, // simple token for v1
+        });
+        break;
+      }
+      case CTRL_PLAYER_CONNECTED: {
+        this.#connectedToGameServer.add(/** @type {string} */ (msg.playerId));
+        const expected = this.#lobby.getPlayers().length;
+        if (this.#connectedToGameServer.size >= expected) {
+          this.#lifecycle.transition(LifecycleState.COUNTDOWN);
+          const countdownMs = this.#config.countdownMs;
+          this.#countdownTimer = setTimeout(() => {
+            this.#countdownTimer = null;
+            if (this.#lifecycle.state === LifecycleState.COUNTDOWN) {
+              this.#lifecycle.transition(LifecycleState.PLAYING);
+            }
+          }, countdownMs);
+        }
+        break;
+      }
+      case CTRL_MATCH_RESULT: {
+        this._handleMatchResults(msg);
+        break;
+      }
+    }
   }
 
   /**
    * Handle match results from the game server.
-   * @param {import("./protocol/controlChannel.js").MatchResultMessage} _msg
+   * @param {unknown} msg
    * @private
    */
-  async _handleMatchResults(_msg) {
-    // TODO: transition to RESULTS, persist stats, broadcast results, return to LOBBY
-    throw new Error("Not implemented");
+  async _handleMatchResults(msg) {
+    const data = /** @type {import("./protocol/controlChannel.js").MatchResultMessage} */ (msg);
+
+    this.#lifecycle.transition(LifecycleState.RESULTS);
+
+    // Persist stats if store configured
+    if (this.#config.statsStore) {
+      try {
+        for (const result of data.results) {
+          const stats = await this.#config.statsStore.getOrCreatePlayer(result.playerId);
+          const update = { matchesPlayed: stats.matchesPlayed + 1 };
+          if (result.outcome === "win") update.wins = stats.wins + 1;
+          else if (result.outcome === "loss") update.losses = stats.losses + 1;
+          else if (result.outcome === "draw") update.draws = stats.draws + 1;
+          update.totalPlaytimeMs = stats.totalPlaytimeMs + data.durationMs;
+          await this.#config.statsStore.updatePlayerStats(result.playerId, update);
+        }
+      } catch (err) {
+        this.#error$.next(/** @type {Error} */ (err));
+      }
+    }
+
+    // Broadcast results to all clients
+    this._broadcast({
+      kind: SESSION_MATCH_RESULTS,
+      results: data.results,
+      durationMs: data.durationMs,
+    });
+
+    this.#matchEnded$.next({ matchId: data.matchId, results: data.results });
+
+    // Clean up game server
+    if (this.#currentInstance) {
+      this.#controlSub?.unsubscribe();
+      this.#controlSub = null;
+      try {
+        await this.#config.spawner.shutdown(this.#currentInstance);
+      } catch {
+        // Ignore shutdown errors
+      }
+      this.#currentInstance = null;
+    }
+    this.#currentMatchId = null;
+    this.#connectedToGameServer.clear();
+
+    // Return to lobby
+    this.#lobby.resetReady();
+    this.#lifecycle.transition(LifecycleState.LOBBY);
+  }
+
+  /**
+   * Abort the current match and return to lobby.
+   * @param {string} reason
+   * @private
+   */
+  _abortToLobby(reason) {
+    if (this.#countdownTimer) {
+      clearTimeout(this.#countdownTimer);
+      this.#countdownTimer = null;
+    }
+
+    this._broadcast({ kind: SESSION_ERROR, message: reason });
+
+    if (this.#currentInstance) {
+      this.#controlSub?.unsubscribe();
+      this.#controlSub = null;
+      this.#currentInstance = null;
+    }
+    this.#currentMatchId = null;
+    this.#connectedToGameServer.clear();
+    this.#lobby.resetReady();
+    this.#lifecycle.reset();
   }
 
   /**
    * Broadcast a message to all connected players.
-   * @param {unknown} _message
+   * @param {unknown} message
    * @private
    */
-  _broadcast(_message) {
-    // TODO: JSON.stringify and send to all connections
-    throw new Error("Not implemented");
+  _broadcast(message) {
+    const data = JSON.stringify(message);
+    for (const ws of this.#connections.values()) {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(data);
+      }
+    }
+  }
+
+  /**
+   * Send a message to a single WebSocket.
+   * @param {import("ws").WebSocket} ws
+   * @param {unknown} message
+   * @private
+   */
+  _sendTo(ws, message) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
+  }
+
+  /**
+   * Reverse lookup: find the playerId for a given WebSocket.
+   * @param {import("ws").WebSocket} ws
+   * @returns {string | undefined}
+   * @private
+   */
+  _playerIdForWs(ws) {
+    for (const [id, sock] of this.#connections) {
+      if (sock === ws) return id;
+    }
+    return undefined;
   }
 }

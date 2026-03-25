@@ -3,6 +3,7 @@
  * @property {string} matchId
  * @property {number} port
  * @property {string} host
+ * @property {import("rxjs").Observable<unknown>} controlMessages$ — observable stream of control-channel messages from the server
  * @property {unknown} [handle] — implementation-specific process/container handle
  */
 
@@ -24,10 +25,9 @@ export class GameServerSpawner {
   /**
    * Spawn a game server instance.
    * @param {SpawnConfig} _config
-   * @param {(message: unknown) => void} _onMessage — callback for control-channel messages from the server
    * @returns {Promise<GameServerInstance>}
    */
-  async spawn(_config, _onMessage) {
+  async spawn(_config) {
     throw new Error("Not implemented");
   }
 
