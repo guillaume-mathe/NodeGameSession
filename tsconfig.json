@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationDir": "dist/types",
+    "outDir": "dist/types",
+    "strict": false,
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "module": "ESNext",
+    "target": "ESNext",
+    "lib": ["ESNext"],
+    "checkJs": false
+  },
+  "include": ["src/**/*.js"],
+  "exclude": ["node_modules", "test", "dist"]
+}
