@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Subject, fromEvent, takeUntil, take } from "rxjs";
+import { Subject, Observable, fromEvent, takeUntil, take } from "rxjs";
 import { WebSocketServer } from "ws";
 import { LifecycleStateMachine, LifecycleState } from "./lifecycle/LifecycleStateMachine.js";
 import { Lobby } from "./lobby/Lobby.js";
@@ -67,6 +67,9 @@ export class SessionManager {
 
   /** @type {import("./spawner/GameServerSpawner.js").GameServerInstance | null} */
   #currentInstance = null;
+
+  /** @type {{ host: string, port: number } | null} */
+  #gameServerAddr = null;
 
   /** @type {import("rxjs").Subscription | null} */
   #controlSub = null;
@@ -141,10 +144,16 @@ export class SessionManager {
   async start(port) {
     this.#wss = new WebSocketServer({ port });
 
-    // Wire up incoming connections
-    fromEvent(this.#wss, "connection")
+    // Wire up incoming connections (use EventEmitter API to avoid
+    // fromEvent's EventTarget detection wrapping args in Event objects)
+    const connection$ = new Observable((subscriber) => {
+      const handler = (/** @type {import("ws").WebSocket} */ ws) => subscriber.next(ws);
+      this.#wss.on("connection", handler);
+      return () => this.#wss.off("connection", handler);
+    });
+    connection$
       .pipe(takeUntil(this.#destroy$))
-      .subscribe((/** @type {import("ws").WebSocket} */ ws) => {
+      .subscribe((ws) => {
         this._handleConnection(ws);
       });
 
@@ -162,17 +171,27 @@ export class SessionManager {
         this._broadcast({ kind: SESSION_PLAYER_JOINED, player });
       });
 
-    // Broadcast player leaves
+    // Broadcast player leaves + updated lobby state
     this.#lobby.playerRemoved$
       .pipe(takeUntil(this.#destroy$))
       .subscribe(({ playerId }) => {
         this._broadcast({ kind: SESSION_PLAYER_LEFT, playerId });
+        this._broadcast({
+          kind: SESSION_LOBBY_STATE,
+          players: this.#lobby.getPlayers(),
+          lifecycleState: this.#lifecycle.state,
+        });
       });
 
-    // Auto-start check on ready changes
+    // Broadcast updated lobby state + auto-start check on ready changes
     this.#lobby.readyChanged$
       .pipe(takeUntil(this.#destroy$))
       .subscribe(() => {
+        this._broadcast({
+          kind: SESSION_LOBBY_STATE,
+          players: this.#lobby.getPlayers(),
+          lifecycleState: this.#lifecycle.state,
+        });
         if (
           this.#lifecycle.state === LifecycleState.LOBBY &&
           this.#lobby.isStartConditionMet()
@@ -213,6 +232,7 @@ export class SessionManager {
       }
       this.#currentInstance = null;
       this.#currentMatchId = null;
+    this.#gameServerAddr = null;
     }
 
     // Close all player connections
@@ -258,19 +278,28 @@ export class SessionManager {
   _handleConnection(ws) {
     const close$ = new Subject();
 
-    fromEvent(ws, "close")
-      .pipe(take(1))
-      .subscribe(() => {
-        close$.next();
-        close$.complete();
-        const playerId = this._playerIdForWs(ws);
-        if (playerId && this.#lifecycle.state === LifecycleState.LOBBY) {
-          this.#lobby.removePlayer(playerId);
-          this.#connections.delete(playerId);
-        }
-      });
+    // Use the EventEmitter API directly (ws.on) instead of fromEvent()
+    // because the ws library's WebSocket implements EventTarget, which
+    // causes RxJS fromEvent() to wrap events as MessageEvent objects
+    // instead of passing raw data.
 
-    fromEvent(ws, "message")
+    ws.on("close", () => {
+      close$.next();
+      close$.complete();
+      const playerId = this._playerIdForWs(ws);
+      if (playerId && this.#lifecycle.state === LifecycleState.LOBBY) {
+        this.#lobby.removePlayer(playerId);
+        this.#connections.delete(playerId);
+      }
+    });
+
+    const message$ = new Observable((subscriber) => {
+      const handler = (/** @type {import("ws").RawData} */ raw) => subscriber.next(raw);
+      ws.on("message", handler);
+      return () => ws.off("message", handler);
+    });
+
+    message$
       .pipe(takeUntil(close$), takeUntil(this.#destroy$))
       .subscribe((/** @type {import("ws").RawData} */ raw) => {
         try {
@@ -293,13 +322,41 @@ export class SessionManager {
 
     switch (data.kind) {
       case CLIENT_JOIN: {
+        const playerId = /** @type {string} */ (data.playerId);
+
+        // If a game is running and this player is part of it, redirect them
+        // back to the game server instead of re-adding to the lobby.
+        if (this.#lifecycle.state !== LifecycleState.LOBBY && this.#gameServerAddr) {
+          const existingWs = this.#connections.get(playerId);
+          if (existingWs || this.#connectedToGameServer.has(playerId)) {
+            this.#connections.set(playerId, ws);
+            this._sendTo(ws, {
+              kind: SESSION_CONNECT_TO_GAME,
+              matchId: this.#currentMatchId,
+              host: this.#gameServerAddr.host,
+              port: this.#gameServerAddr.port,
+              token: playerId,
+            });
+            break;
+          }
+        }
+
         try {
+          // If the player already exists (e.g. page refresh before close fires),
+          // evict the stale connection and re-add.
+          const existingWs = this.#connections.get(playerId);
+          if (existingWs && existingWs !== ws) {
+            this.#lobby.removePlayer(playerId);
+            this.#connections.delete(playerId);
+          }
+
           const player = this.#lobby.addPlayer(
-            /** @type {string} */ (data.playerId),
+            playerId,
             /** @type {string} */ (data.displayName),
           );
           this.#connections.set(player.playerId, ws);
-          this._sendTo(ws, {
+          // Broadcast full lobby state to all players so everyone sees the update
+          this._broadcast({
             kind: SESSION_LOBBY_STATE,
             players: this.#lobby.getPlayers(),
             lifecycleState: this.#lifecycle.state,
@@ -419,14 +476,20 @@ export class SessionManager {
     switch (msg.kind) {
       case CTRL_READY: {
         this.#lifecycle.transition(LifecycleState.SYNC_WAIT);
-        // Tell all clients to connect to the game server
-        this._broadcast({
-          kind: SESSION_CONNECT_TO_GAME,
-          matchId: this.#currentMatchId,
+        this.#gameServerAddr = {
           host: /** @type {string} */ (msg.host),
           port: /** @type {number} */ (msg.port),
-          token: this.#currentMatchId, // simple token for v1
-        });
+        };
+        // Tell each client to connect to the game server with a per-player token
+        for (const [playerId, ws] of this.#connections) {
+          this._sendTo(ws, {
+            kind: SESSION_CONNECT_TO_GAME,
+            matchId: this.#currentMatchId,
+            host: this.#gameServerAddr.host,
+            port: this.#gameServerAddr.port,
+            token: playerId,
+          });
+        }
         break;
       }
       case CTRL_PLAYER_CONNECTED: {
@@ -487,23 +550,28 @@ export class SessionManager {
 
     this.#matchEnded$.next({ matchId: data.matchId, results: data.results });
 
-    // Clean up game server
-    if (this.#currentInstance) {
-      this.#controlSub?.unsubscribe();
-      this.#controlSub = null;
-      try {
-        await this.#config.spawner.shutdown(this.#currentInstance);
-      } catch {
-        // Ignore shutdown errors
+    // Delay before tearing down — give clients time to show the results screen
+    const RESULTS_DISPLAY_MS = 20000;
+    setTimeout(async () => {
+      // Clean up game server
+      if (this.#currentInstance) {
+        this.#controlSub?.unsubscribe();
+        this.#controlSub = null;
+        try {
+          await this.#config.spawner.shutdown(this.#currentInstance);
+        } catch {
+          // Ignore shutdown errors
+        }
+        this.#currentInstance = null;
       }
-      this.#currentInstance = null;
-    }
-    this.#currentMatchId = null;
-    this.#connectedToGameServer.clear();
+      this.#currentMatchId = null;
+      this.#gameServerAddr = null;
+      this.#connectedToGameServer.clear();
 
-    // Return to lobby
-    this.#lobby.resetReady();
-    this.#lifecycle.transition(LifecycleState.LOBBY);
+      // Return to lobby
+      this.#lobby.resetReady();
+      this.#lifecycle.transition(LifecycleState.LOBBY);
+    }, RESULTS_DISPLAY_MS);
   }
 
   /**
@@ -525,6 +593,7 @@ export class SessionManager {
       this.#currentInstance = null;
     }
     this.#currentMatchId = null;
+    this.#gameServerAddr = null;
     this.#connectedToGameServer.clear();
     this.#lobby.resetReady();
     this.#lifecycle.reset();
