@@ -80,6 +80,9 @@ export class SessionManager {
   /** @type {Set<string>} */
   #connectedToGameServer = new Set();
 
+  /** @type {Map<string, import("./stats/StatsStore.js").PlayerStats>} */
+  #statsCache = new Map();
+
   // ── Public observables ────────────────────────────────────────────
 
   /** @type {Subject<{ matchId: string }>} */
@@ -176,22 +179,14 @@ export class SessionManager {
       .pipe(takeUntil(this.#destroy$))
       .subscribe(({ playerId }) => {
         this._broadcast({ kind: SESSION_PLAYER_LEFT, playerId });
-        this._broadcast({
-          kind: SESSION_LOBBY_STATE,
-          players: this.#lobby.getPlayers(),
-          lifecycleState: this.#lifecycle.state,
-        });
+        this._broadcastLobbyState();
       });
 
     // Broadcast updated lobby state + auto-start check on ready changes
     this.#lobby.readyChanged$
       .pipe(takeUntil(this.#destroy$))
       .subscribe(() => {
-        this._broadcast({
-          kind: SESSION_LOBBY_STATE,
-          players: this.#lobby.getPlayers(),
-          lifecycleState: this.#lifecycle.state,
-        });
+        this._broadcastLobbyState();
         if (
           this.#lifecycle.state === LifecycleState.LOBBY &&
           this.#lobby.isStartConditionMet()
@@ -355,12 +350,15 @@ export class SessionManager {
             /** @type {string} */ (data.displayName),
           );
           this.#connections.set(player.playerId, ws);
-          // Broadcast full lobby state to all players so everyone sees the update
-          this._broadcast({
-            kind: SESSION_LOBBY_STATE,
-            players: this.#lobby.getPlayers(),
-            lifecycleState: this.#lifecycle.state,
-          });
+          // Fetch stats and broadcast lobby state with stats enrichment
+          if (this.#config.statsStore) {
+            this.#config.statsStore.getOrCreatePlayer(playerId).then((stats) => {
+              this.#statsCache.set(playerId, stats);
+              this._broadcastLobbyState();
+            }).catch(() => this._broadcastLobbyState());
+          } else {
+            this._broadcastLobbyState();
+          }
         } catch (err) {
           this._sendTo(ws, {
             kind: SESSION_ERROR,
@@ -534,7 +532,8 @@ export class SessionManager {
           else if (result.outcome === "loss") update.losses = stats.losses + 1;
           else if (result.outcome === "draw") update.draws = stats.draws + 1;
           update.totalPlaytimeMs = stats.totalPlaytimeMs + data.durationMs;
-          await this.#config.statsStore.updatePlayerStats(result.playerId, update);
+          const updated = await this.#config.statsStore.updatePlayerStats(result.playerId, update);
+          this.#statsCache.set(result.playerId, updated);
         }
       } catch (err) {
         this.#error$.next(/** @type {Error} */ (err));
@@ -611,6 +610,23 @@ export class SessionManager {
         ws.send(data);
       }
     }
+  }
+
+  /**
+   * Broadcast the lobby state with optional stats enrichment.
+   * @private
+   */
+  _broadcastLobbyState() {
+    const players = this.#lobby.getPlayers().map((p) => {
+      const stats = this.#statsCache.get(p.playerId);
+      if (!stats) return p;
+      return { ...p, wins: stats.wins, losses: stats.losses, draws: stats.draws };
+    });
+    this._broadcast({
+      kind: SESSION_LOBBY_STATE,
+      players,
+      lifecycleState: this.#lifecycle.state,
+    });
   }
 
   /**
