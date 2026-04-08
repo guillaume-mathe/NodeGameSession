@@ -301,10 +301,7 @@ describe("SessionManager", () => {
     expect(session.lifecycle.state).toBe(LifecycleState.RESULTS);
     expect(matchEnded).toHaveBeenCalled();
 
-    // Unready players during results so auto-start doesn't fire on LOBBY return
-    ws1.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
-    ws2.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
-
+    // Ready state is reset on entering RESULTS, so no manual unready needed.
     // Wait for results display delay (50ms) + cleanup
     await vi.waitFor(() => {
       expect(session.lifecycle.state).toBe(LifecycleState.LOBBY);
@@ -430,10 +427,7 @@ describe("SessionManager", () => {
       durationMs: 30000,
     });
 
-    // Unready players during results so auto-start doesn't fire on LOBBY return
-    ws1.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
-    ws2.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
-
+    // Ready state is reset on entering RESULTS — no manual unready needed
     await vi.waitFor(() => {
       expect(session.lifecycle.state).toBe(LifecycleState.LOBBY);
     });
@@ -465,5 +459,215 @@ describe("SessionManager", () => {
       gameLogicModulePath: "./game-logic.js",
     });
     await session.start(0);
+  });
+});
+
+// ── Integration: full lobby loop ───────────────────────────────────
+
+describe("SessionManager — lobby loop integration", () => {
+  /** @type {SessionManager} */
+  let session;
+  let spawner;
+
+  beforeEach(async () => {
+    spawner = createMockSpawner();
+    session = new SessionManager({
+      minPlayers: 2,
+      maxPlayers: 4,
+      countdownMs: 10,
+      resultsDisplayMs: 50,
+      spawner,
+      gameLogicModulePath: "./game-logic.js",
+    });
+    await session.start(0);
+  });
+
+  afterEach(async () => {
+    await session.shutdown();
+  });
+
+  function connectAndJoin(playerId, displayName) {
+    const ws = new MockWebSocket();
+    session._handleConnection(ws);
+    ws.emit("message", JSON.stringify({ kind: CLIENT_JOIN, playerId, displayName }));
+    return ws;
+  }
+
+  /**
+   * Drive the state machine from STARTING through to PLAYING.
+   * Returns the matchId reported by matchStarted$.
+   */
+  async function driveToPlaying(ws1, ws2, matchStartedFn) {
+    await vi.waitFor(() => expect(spawner.spawn).toHaveBeenCalled());
+
+    const matchId = matchStartedFn.mock.calls.at(-1)[0].matchId;
+
+    // Game server ready → SYNC_WAIT
+    spawner.emitControl({ kind: CTRL_READY, matchId, port: 9100, host: "127.0.0.1" });
+    expect(session.lifecycle.state).toBe(LifecycleState.SYNC_WAIT);
+
+    // Both players connect → COUNTDOWN
+    spawner.emitControl({ kind: CTRL_PLAYER_CONNECTED, matchId, playerId: "p1" });
+    spawner.emitControl({ kind: CTRL_PLAYER_CONNECTED, matchId, playerId: "p2" });
+    expect(session.lifecycle.state).toBe(LifecycleState.COUNTDOWN);
+
+    // Wait for countdown → PLAYING
+    await vi.waitFor(
+      () => expect(session.lifecycle.state).toBe(LifecycleState.PLAYING),
+      { timeout: 500 },
+    );
+
+    return matchId;
+  }
+
+  /** Emit match results from the game server. */
+  function endMatch(matchId) {
+    spawner.emitControl({
+      kind: CTRL_MATCH_RESULT,
+      matchId,
+      results: [
+        { playerId: "p1", outcome: "win", score: 1 },
+        { playerId: "p2", outcome: "loss", score: 0 },
+      ],
+      durationMs: 10000,
+    });
+  }
+
+  // ── Scenario 1: timer expires, no one readies → stays in LOBBY ───
+
+  it("returns to LOBBY after results timeout without auto-starting", async () => {
+    const matchStarted = vi.fn();
+    session.matchStarted$.subscribe(matchStarted);
+
+    const ws1 = connectAndJoin("p1", "Alice");
+    const ws2 = connectAndJoin("p2", "Bob");
+
+    // Ready → start → play
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    const matchId = await driveToPlaying(ws1, ws2, matchStarted);
+
+    // End the match
+    endMatch(matchId);
+    expect(session.lifecycle.state).toBe(LifecycleState.RESULTS);
+
+    // Nobody readies — wait for results display timeout
+    await vi.waitFor(() => {
+      expect(session.lifecycle.state).toBe(LifecycleState.LOBBY);
+    });
+
+    // Should NOT have auto-started a second match
+    expect(matchStarted).toHaveBeenCalledTimes(1);
+
+    // Players should be unready
+    const players = session.lobby.getPlayers();
+    expect(players.every((p) => !p.ready)).toBe(true);
+  });
+
+  // ── Scenario 2: all players ready during RESULTS → skip timer ────
+
+  it("skips results timer when all players re-ready during RESULTS", async () => {
+    const matchStarted = vi.fn();
+    session.matchStarted$.subscribe(matchStarted);
+
+    const ws1 = connectAndJoin("p1", "Alice");
+    const ws2 = connectAndJoin("p2", "Bob");
+
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    const matchId = await driveToPlaying(ws1, ws2, matchStarted);
+
+    endMatch(matchId);
+    expect(session.lifecycle.state).toBe(LifecycleState.RESULTS);
+
+    // Both players re-ready during RESULTS
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+
+    // Should immediately transition past LOBBY into a new match
+    await vi.waitFor(() => {
+      expect(matchStarted).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ── Scenario 3: lobby state broadcasts include lifecycle state ───
+
+  it("broadcasts correct lifecycleState in lobby state during RESULTS", async () => {
+    const matchStarted = vi.fn();
+    session.matchStarted$.subscribe(matchStarted);
+
+    const ws1 = connectAndJoin("p1", "Alice");
+    const ws2 = connectAndJoin("p2", "Bob");
+
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    const matchId = await driveToPlaying(ws1, ws2, matchStarted);
+
+    ws1.sent.length = 0;
+    endMatch(matchId);
+
+    // A player readies during RESULTS — lobby state should say "RESULTS"
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+
+    const lobbyMsg = ws1.sent.find(
+      (m) => m.kind === SESSION_LOBBY_STATE && m.lifecycleState === "RESULTS",
+    );
+    expect(lobbyMsg).toBeDefined();
+  });
+
+  // ── Scenario 4: two consecutive matches ──────────────────────────
+
+  it("plays two full matches back-to-back", async () => {
+    const matchStarted = vi.fn();
+    const matchEnded = vi.fn();
+    session.matchStarted$.subscribe(matchStarted);
+    session.matchEnded$.subscribe(matchEnded);
+
+    const ws1 = connectAndJoin("p1", "Alice");
+    const ws2 = connectAndJoin("p2", "Bob");
+
+    // ── Match 1 ──
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    const matchId1 = await driveToPlaying(ws1, ws2, matchStarted);
+    endMatch(matchId1);
+
+    expect(session.lifecycle.state).toBe(LifecycleState.RESULTS);
+
+    // Wait for results timeout → LOBBY
+    await vi.waitFor(() => {
+      expect(session.lifecycle.state).toBe(LifecycleState.LOBBY);
+    });
+
+    expect(matchEnded).toHaveBeenCalledTimes(1);
+
+    // ── Match 2 — re-ready and play again ──
+    // Need a fresh spawner for the second match
+    spawner.spawn.mockImplementation(async (config) => {
+      const ctrl$ = new Subject();
+      spawner.emitControl = (msg) => ctrl$.next(msg);
+      spawner.completeControl = () => ctrl$.complete();
+      return {
+        matchId: config.matchId,
+        port: 9101,
+        host: "127.0.0.1",
+        controlMessages$: ctrl$.asObservable(),
+      };
+    });
+
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_READY }));
+    const matchId2 = await driveToPlaying(ws1, ws2, matchStarted);
+
+    expect(matchId2).not.toBe(matchId1);
+
+    endMatch(matchId2);
+
+    await vi.waitFor(() => {
+      expect(session.lifecycle.state).toBe(LifecycleState.LOBBY);
+    });
+
+    expect(matchStarted).toHaveBeenCalledTimes(2);
+    expect(matchEnded).toHaveBeenCalledTimes(2);
   });
 });

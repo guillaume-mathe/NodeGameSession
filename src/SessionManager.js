@@ -78,6 +78,9 @@ export class SessionManager {
   /** @type {ReturnType<typeof setTimeout> | null} */
   #countdownTimer = null;
 
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  #resultsTimer = null;
+
   /** @type {Set<string>} */
   #connectedToGameServer = new Set();
 
@@ -188,11 +191,18 @@ export class SessionManager {
       .pipe(takeUntil(this.#destroy$))
       .subscribe(() => {
         this._broadcastLobbyState();
-        if (
-          this.#lifecycle.state === LifecycleState.LOBBY &&
-          this.#lobby.isStartConditionMet()
-        ) {
-          this._startMatch();
+        if (this.#lobby.isStartConditionMet()) {
+          if (this.#lifecycle.state === LifecycleState.LOBBY) {
+            this._startMatch();
+          } else if (
+            this.#lifecycle.state === LifecycleState.RESULTS &&
+            this.#resultsTimer
+          ) {
+            // All players ready during results — skip remaining display time
+            clearTimeout(this.#resultsTimer);
+            this.#resultsTimer = null;
+            this._teardownAndReturnToLobby();
+          }
         }
       });
 
@@ -211,10 +221,14 @@ export class SessionManager {
     this.#destroy$.next();
     this.#destroy$.complete();
 
-    // Clear countdown timer
+    // Clear timers
     if (this.#countdownTimer) {
       clearTimeout(this.#countdownTimer);
       this.#countdownTimer = null;
+    }
+    if (this.#resultsTimer) {
+      clearTimeout(this.#resultsTimer);
+      this.#resultsTimer = null;
     }
 
     // Shut down game server if running
@@ -523,6 +537,9 @@ export class SessionManager {
 
     this.#lifecycle.transition(LifecycleState.RESULTS);
 
+    // Clear ready state so players must actively re-ready to start the next match
+    this.#lobby.resetReady();
+
     // Persist stats if store configured
     if (this.#config.statsStore) {
       try {
@@ -550,31 +567,42 @@ export class SessionManager {
 
     this.#matchEnded$.next({ matchId: data.matchId, results: data.results });
 
-    // Delay before tearing down — give clients time to show the results screen
+    // Delay before tearing down — give clients time to show the results screen.
+    // If all players ready during this window, the timer is cleared early.
     const RESULTS_DISPLAY_MS = this.#config.resultsDisplayMs ?? 20000;
-    setTimeout(async () => {
-      // Clean up game server
-      if (this.#currentInstance) {
-        this.#controlSub?.unsubscribe();
-        this.#controlSub = null;
-        try {
-          await this.#config.spawner.shutdown(this.#currentInstance);
-        } catch {
-          // Ignore shutdown errors
-        }
-        this.#currentInstance = null;
-      }
-      this.#currentMatchId = null;
-      this.#gameServerAddr = null;
-      this.#connectedToGameServer.clear();
-
-      // Return to lobby — keep any ready state players set during RESULTS
-      this.#lifecycle.transition(LifecycleState.LOBBY);
-      this._broadcastLobbyState();
-      if (this.#lobby.isStartConditionMet()) {
-        this._startMatch();
-      }
+    this.#resultsTimer = setTimeout(() => {
+      this.#resultsTimer = null;
+      this._teardownAndReturnToLobby();
     }, RESULTS_DISPLAY_MS);
+  }
+
+  /**
+   * Clean up the game server and transition back to LOBBY.
+   * Called either when the results display timer expires or when
+   * all players ready during RESULTS (skipping the timer).
+   * @private
+   */
+  _teardownAndReturnToLobby() {
+    // Detach from the game server immediately
+    this.#controlSub?.unsubscribe();
+    this.#controlSub = null;
+    this.#currentMatchId = null;
+    this.#gameServerAddr = null;
+    this.#connectedToGameServer.clear();
+
+    // Shut down the game server process in the background (don't block lobby)
+    const instance = this.#currentInstance;
+    this.#currentInstance = null;
+    if (instance) {
+      this.#config.spawner.shutdown(instance).catch(() => {});
+    }
+
+    // Return to lobby — keep any ready state players set during RESULTS
+    this.#lifecycle.transition(LifecycleState.LOBBY);
+    this._broadcastLobbyState();
+    if (this.#lobby.isStartConditionMet()) {
+      this._startMatch();
+    }
   }
 
   /**
@@ -586,6 +614,10 @@ export class SessionManager {
     if (this.#countdownTimer) {
       clearTimeout(this.#countdownTimer);
       this.#countdownTimer = null;
+    }
+    if (this.#resultsTimer) {
+      clearTimeout(this.#resultsTimer);
+      this.#resultsTimer = null;
     }
 
     this._broadcast({ kind: SESSION_ERROR, message: reason });
