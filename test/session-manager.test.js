@@ -144,15 +144,17 @@ describe("SessionManager", () => {
     expect(joinMsg.player.playerId).toBe("p2");
   });
 
-  it("sends error on duplicate join", () => {
-    connectAndJoin("p1", "Alice");
+  it("evicts stale connection on duplicate join", () => {
+    const ws1 = connectAndJoin("p1", "Alice");
     const ws2 = new MockWebSocket();
     session._handleConnection(ws2);
     ws2.emit("message", JSON.stringify({ kind: CLIENT_JOIN, playerId: "p1", displayName: "Alice" }));
 
-    const errorMsg = ws2.sent.find((m) => m.kind === SESSION_ERROR);
-    expect(errorMsg).toBeDefined();
-    expect(errorMsg.message).toContain("already in the lobby");
+    // The new connection should receive lobby state (not an error)
+    const lobbyState = ws2.sent.find((m) => m.kind === SESSION_LOBBY_STATE);
+    expect(lobbyState).toBeDefined();
+    expect(lobbyState.players).toHaveLength(1);
+    expect(lobbyState.players[0].playerId).toBe("p1");
   });
 
   // ── Ready state ───────────────────────────────────────────────────
@@ -215,6 +217,19 @@ describe("SessionManager", () => {
   // ── Full lifecycle ────────────────────────────────────────────────
 
   it("runs full lifecycle: join → ready → start → results → lobby", async () => {
+    // Re-create session with short results display delay for testing
+    await session.shutdown();
+    spawner = createMockSpawner();
+    session = new SessionManager({
+      minPlayers: 2,
+      maxPlayers: 4,
+      countdownMs: 100,
+      resultsDisplayMs: 50,
+      spawner,
+      gameLogicModulePath: "./game-logic.js",
+    });
+    await session.start(0);
+
     const matchStarted = vi.fn();
     const matchEnded = vi.fn();
     session.matchStarted$.subscribe(matchStarted);
@@ -283,12 +298,17 @@ describe("SessionManager", () => {
       durationMs: 60000,
     });
 
-    // Wait for async _handleMatchResults to complete
+    expect(session.lifecycle.state).toBe(LifecycleState.RESULTS);
+    expect(matchEnded).toHaveBeenCalled();
+
+    // Unready players during results so auto-start doesn't fire on LOBBY return
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
+
+    // Wait for results display delay (50ms) + cleanup
     await vi.waitFor(() => {
       expect(session.lifecycle.state).toBe(LifecycleState.LOBBY);
     });
-
-    expect(matchEnded).toHaveBeenCalled();
 
     // Verify results broadcast
     const resultsMsg = ws1.sent.find((m) => m.kind === SESSION_MATCH_RESULTS);
@@ -371,6 +391,7 @@ describe("SessionManager", () => {
       minPlayers: 2,
       maxPlayers: 4,
       countdownMs: 10,
+      resultsDisplayMs: 50,
       spawner,
       gameLogicModulePath: "./game-logic.js",
       statsStore: mockStats,
@@ -409,11 +430,17 @@ describe("SessionManager", () => {
       durationMs: 30000,
     });
 
+    // Unready players during results so auto-start doesn't fire on LOBBY return
+    ws1.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
+    ws2.emit("message", JSON.stringify({ kind: CLIENT_UNREADY }));
+
     await vi.waitFor(() => {
       expect(session.lifecycle.state).toBe(LifecycleState.LOBBY);
     });
 
-    expect(mockStats.getOrCreatePlayer).toHaveBeenCalledTimes(2);
+    // getOrCreatePlayer is also called on JOIN for stats enrichment (2 calls),
+    // plus 2 calls for stats persistence on match end = 4 total
+    expect(mockStats.getOrCreatePlayer).toHaveBeenCalledTimes(4);
     expect(mockStats.updatePlayerStats).toHaveBeenCalledTimes(2);
     expect(mockStats.updatePlayerStats).toHaveBeenCalledWith("p1", expect.objectContaining({ wins: 1 }));
     expect(mockStats.updatePlayerStats).toHaveBeenCalledWith("p2", expect.objectContaining({ losses: 1 }));

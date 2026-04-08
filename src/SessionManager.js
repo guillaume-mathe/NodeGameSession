@@ -28,6 +28,7 @@ import {
  * @property {number} maxPlayers
  * @property {number} [countdownMs=3000]
  * @property {number} [reconnectGraceMs=10000]
+ * @property {number} [resultsDisplayMs=20000]
  * @property {import("./stats/StatsStore.js").StatsStore} [statsStore]
  * @property {import("./spawner/GameServerSpawner.js").GameServerSpawner} spawner
  * @property {number} [tickRateHz=20]
@@ -550,7 +551,7 @@ export class SessionManager {
     this.#matchEnded$.next({ matchId: data.matchId, results: data.results });
 
     // Delay before tearing down — give clients time to show the results screen
-    const RESULTS_DISPLAY_MS = 20000;
+    const RESULTS_DISPLAY_MS = this.#config.resultsDisplayMs ?? 20000;
     setTimeout(async () => {
       // Clean up game server
       if (this.#currentInstance) {
@@ -567,9 +568,12 @@ export class SessionManager {
       this.#gameServerAddr = null;
       this.#connectedToGameServer.clear();
 
-      // Return to lobby
-      this.#lobby.resetReady();
+      // Return to lobby — keep any ready state players set during RESULTS
       this.#lifecycle.transition(LifecycleState.LOBBY);
+      this._broadcastLobbyState();
+      if (this.#lobby.isStartConditionMet()) {
+        this._startMatch();
+      }
     }, RESULTS_DISPLAY_MS);
   }
 
